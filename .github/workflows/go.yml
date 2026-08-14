@@ -31,6 +31,7 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
