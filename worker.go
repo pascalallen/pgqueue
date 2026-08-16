@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,10 @@ import (
 // immediately if the error is wrapped with Permanent). Delivery is
 // at-least-once: handlers must tolerate re-execution of the same job.
 type Handler func(ctx context.Context, job Job) error
+
+// Middleware wraps a Handler — for metrics, tracing, logging, or per-job
+// setup — without the library taking on those dependencies itself.
+type Middleware func(next Handler) Handler
 
 type WorkerConfig struct {
 	// QueueName selects which queue to consume. Default "default".
@@ -36,9 +41,21 @@ type WorkerConfig struct {
 	Backoff func(attempt int) time.Duration
 	// RescueAfter re-queues jobs stuck in 'running' longer than this —
 	// orphans left by a crashed process. It must comfortably exceed the
-	// longest handler runtime. Default 5m.
+	// longest handler runtime (JobTimeout, when set). Default 5m.
 	RescueAfter time.Duration
-	Logger      Logger
+	// JobTimeout bounds each handler invocation: the handler's context is
+	// canceled once it elapses and the attempt fails with the context error.
+	// Zero (the default) leaves handlers unbounded, so a hung handler blocks
+	// drain forever — set it unless every handler already bounds itself.
+	JobTimeout time.Duration
+	// Retain, when set, makes the worker prune this queue's completed and
+	// dead jobs whose last update is older than Retain (see Queue.Prune)
+	// during its maintenance sweep. Zero (the default) never prunes.
+	Retain time.Duration
+	// Middleware wraps every registered handler; the first entry is the
+	// outermost. Applied at Register time, so it must be set before then.
+	Middleware []Middleware
+	Logger     Logger
 }
 
 // Worker claims and executes jobs from one queue. Register handlers, then
@@ -105,6 +122,9 @@ func (w *Worker) Register(jobType string, h Handler) {
 	if w.started.Load() {
 		panic("pgqueue: Register called after Start")
 	}
+	for i := len(w.cfg.Middleware) - 1; i >= 0; i-- {
+		h = w.cfg.Middleware[i](h)
+	}
 	w.handlers[jobType] = h
 }
 
@@ -128,20 +148,47 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	execCtx := context.WithoutCancel(ctx)
 
-	ticker := time.NewTicker(w.cfg.PollInterval)
-	defer ticker.Stop()
+	poll := time.NewTicker(w.cfg.PollInterval)
+	defer poll.Stop()
+	// Rescue and retention are housekeeping, not per-wake work: they run once
+	// at startup and then on their own, slower cadence, so a busy queue's
+	// stream of NOTIFY wakeups does not cost a rescue UPDATE each.
+	maintain := time.NewTicker(max(w.cfg.PollInterval, w.cfg.RescueAfter/2))
+	defer maintain.Stop()
+	w.maintain(ctx)
 
 	for {
-		w.rescue(ctx)
 		w.claimAndRun(ctx, execCtx)
 
 		select {
 		case <-ctx.Done():
 			w.wg.Wait()
 			return nil
-		case <-ticker.C:
+		case <-poll.C:
+		case <-maintain.C:
+			w.maintain(ctx)
 		case <-w.wake:
 		}
+	}
+}
+
+func (w *Worker) maintain(ctx context.Context) {
+	w.rescue(ctx)
+	if w.cfg.Retain > 0 {
+		w.prune(ctx)
+	}
+}
+
+func (w *Worker) prune(ctx context.Context) {
+	res, err := w.db.ExecContext(ctx, pruneQuery, w.cfg.QueueName, w.cfg.Retain.Seconds())
+	if err != nil {
+		if ctx.Err() == nil {
+			w.cfg.Logger.Error("pgqueue: prune failed", "error", err, "queue", w.cfg.QueueName)
+		}
+		return
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		w.cfg.Logger.Debug("pgqueue: pruned finished jobs", "count", n, "queue", w.cfg.QueueName)
 	}
 }
 
@@ -239,7 +286,7 @@ WHERE id IN (
     LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, queue, job_type, payload, attempts, max_attempts, run_at, COALESCE(last_error, '')`
+RETURNING id, queue, job_type, payload, attempts, max_attempts, run_at, created_at, COALESCE(last_error, '')`
 
 func (w *Worker) claimAndRun(ctx context.Context, execCtx context.Context) {
 	for {
@@ -288,7 +335,7 @@ func (w *Worker) claim(ctx context.Context, limit int) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Queue, &job.Type, &job.Payload, &job.Attempts, &job.MaxAttempts, &job.RunAt, &job.LastError); err != nil {
+		if err := rows.Scan(&job.ID, &job.Queue, &job.Type, &job.Payload, &job.Attempts, &job.MaxAttempts, &job.RunAt, &job.CreatedAt, &job.LastError); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -353,8 +400,14 @@ func (w *Worker) finish(ctx context.Context, job Job, outcome string, query stri
 }
 
 func (w *Worker) runHandler(ctx context.Context, handler Handler, job Job) (err error) {
+	if w.cfg.JobTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, w.cfg.JobTimeout)
+		defer cancel()
+	}
 	defer func() {
 		if r := recover(); r != nil {
+			w.cfg.Logger.Error("pgqueue: handler panicked", "panic", r, "stack", string(debug.Stack()), "job_id", job.ID, "job_type", job.Type, "attempt", job.Attempts)
 			err = fmt.Errorf("pgqueue: handler panicked: %v", r)
 		}
 	}()
