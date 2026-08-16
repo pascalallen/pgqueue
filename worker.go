@@ -97,7 +97,7 @@ func DefaultBackoff(attempt int) time.Duration {
 
 // ErrAlreadyStarted is returned by Worker.Start and Subscriber.Start when the
 // receiver has already been started.
-var ErrAlreadyStarted = errors.New("pgqueue: worker already started")
+var ErrAlreadyStarted = errors.New("pgqueue: already started")
 
 // Register maps a job type to its handler. It panics if called after Start:
 // the handler map is read without locking by running jobs.
