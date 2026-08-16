@@ -44,7 +44,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Analysis tools track current Go; run them once, on the stable leg.
       - name: Staticcheck
+        if: matrix.go == 'stable'
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           staticcheck ./...
@@ -55,6 +57,7 @@ jobs:
           PGQUEUE_TEST_DSN: host=localhost port=5432 user=postgres dbname=postgres sslmode=disable
 
       - name: Vulnerability check
+        if: matrix.go == 'stable'
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
