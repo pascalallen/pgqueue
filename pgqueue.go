@@ -126,10 +126,17 @@ func (q *Queue) EnqueueTx(ctx context.Context, tx *sql.Tx, jobType string, paylo
 	return q.enqueue(ctx, tx, jobType, payload, opts...)
 }
 
+// enqueueQuery inserts the job and issues the wakeup NOTIFY in one statement,
+// so on a plain *sql.DB they commit (or fail) together: the caller never sees
+// an error for a job that was actually persisted, and enqueue costs a single
+// round trip. Inside a transaction the NOTIFY is delivered only on commit.
 const enqueueQuery = `
-INSERT INTO pgqueue_jobs (queue, job_type, payload, max_attempts, run_at)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id`
+WITH inserted AS (
+    INSERT INTO pgqueue_jobs (queue, job_type, payload, max_attempts, run_at)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING id
+)
+SELECT id, pg_notify($6, $1) FROM inserted`
 
 func (q *Queue) enqueue(ctx context.Context, db DBTX, jobType string, payload []byte, opts ...EnqueueOption) (int64, error) {
 	settings := enqueueSettings{
@@ -143,14 +150,13 @@ func (q *Queue) enqueue(ctx context.Context, db DBTX, jobType string, payload []
 		payload = []byte("{}")
 	}
 
-	var id int64
-	err := db.QueryRowContext(ctx, enqueueQuery, q.name, jobType, payload, settings.maxAttempts, settings.runAt).Scan(&id)
+	var (
+		id     int64
+		notify any // pg_notify returns void; scanned and discarded
+	)
+	err := db.QueryRowContext(ctx, enqueueQuery, q.name, jobType, payload, settings.maxAttempts, settings.runAt, jobsChannel).Scan(&id, &notify)
 	if err != nil {
 		return 0, fmt.Errorf("pgqueue: enqueue %s: %w", jobType, err)
-	}
-
-	if _, err := db.ExecContext(ctx, `SELECT pg_notify($1, $2)`, jobsChannel, q.name); err != nil {
-		return 0, fmt.Errorf("pgqueue: notify after enqueue %s: %w", jobType, err)
 	}
 
 	q.logger.Debug("pgqueue: job enqueued", "job_id", id, "queue", q.name, "job_type", jobType)

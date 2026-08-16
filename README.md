@@ -77,7 +77,8 @@ w.Register("send_welcome_email", func(ctx context.Context, job pgqueue.Job) erro
 
 go func() {
     if err := w.Start(ctx); err != nil {
-        // Start only fails before the claim loop begins (already started, LISTEN error).
+        // Start only fails before the claim loop begins: ErrAlreadyStarted, or
+        // the LISTEN connection could not be established before ctx was canceled.
     }
 }()
 
@@ -111,7 +112,8 @@ s.Handle("orders_updated", func(payload []byte) {
 })
 
 if err := s.Start(ctx); err != nil {
-    // LISTEN failed; Start returns nil once ctx is canceled.
+    // LISTEN could not be established before ctx was canceled, or Start was
+    // called twice; once listening, Start returns nil when ctx is canceled.
 }
 
 ...
@@ -121,11 +123,16 @@ if err := s.Start(ctx); err != nil {
 
 - Workers claim batches with `FOR UPDATE SKIP LOCKED`, so any number of processes can consume the same queue without double-processing a claimed job.
 - A failed job retries with exponential backoff (default: doubling from 2s to a ceiling of ~4m16s, plus up to 25% jitter) until `MaxAttempts` (default 5), then remains in the table with `status = 'dead'` for inspection. Wrap an error with `pgqueue.Permanent` to skip retries and dead-letter immediately.
-- A rescue sweep re-queues jobs stuck in `running` longer than `RescueAfter` (default 5m) — orphans left by a crashed worker. This makes delivery at-least-once: handlers must tolerate being invoked more than once for the same job.
+- A rescue sweep re-queues jobs stuck in `running` longer than `RescueAfter` (default 5m) — orphans left by a crashed worker. This makes delivery at-least-once: handlers must tolerate being invoked more than once for the same job. A rescued job that has already used all of its attempts (one that crashed the process every time, say) is dead-lettered instead of re-queued.
+- Terminal writes are fenced on the claimed attempt: if a slow handler outlives `RescueAfter` and the job is rescued and re-run, the stale run's result is dropped rather than overwriting the newer run's. Set `RescueAfter` comfortably above your longest handler runtime so this stays a safety net, not the norm.
 
 ### Schema ownership
 
 pgqueue never runs migrations. The `pgqueue.Schema` constant creates the `pgqueue_jobs` table and its indexes, and `pgqueue.SchemaDown` drops everything it creates — copy them into your application's own migration files. If a release ever changes `Schema`, add a follow-up migration in the host application.
+
+### Logging
+
+`pgqueue.Logger` is the four-method subset (`Debug`/`Info`/`Warn`/`Error` with key-value pairs) that `*slog.Logger` already satisfies, so pass `slog.Default()` or your own structured logger; the default is silent.
 
 ### Pub/sub is not durable
 

@@ -3,6 +3,7 @@ package pgqueue
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/lib/pq"
@@ -25,6 +26,7 @@ type Subscriber struct {
 	dsn      string
 	logger   Logger
 	handlers map[string]func(payload []byte)
+	started  atomic.Bool
 }
 
 // NewSubscriber takes a lib/pq connection string for the dedicated LISTEN
@@ -41,10 +43,13 @@ func NewSubscriber(dsn string, logger Logger) *Subscriber {
 	}
 }
 
-// Handle registers a callback for one channel. Not safe to call after Start.
-// Callbacks run sequentially on the subscriber's goroutine — keep them fast
-// or hand off internally.
+// Handle registers a callback for one channel. It panics if called after
+// Start. Callbacks run sequentially on the subscriber's goroutine — keep them
+// fast or hand off internally.
 func (s *Subscriber) Handle(channel string, fn func(payload []byte)) {
+	if s.started.Load() {
+		panic("pgqueue: Handle called after Start")
+	}
 	s.handlers[channel] = fn
 }
 
@@ -52,14 +57,19 @@ func (s *Subscriber) Handle(channel string, fn func(payload []byte)) {
 // connection is re-establishing are lost — Subscriber is a real-time signal,
 // not a durable stream.
 func (s *Subscriber) Start(ctx context.Context) error {
-	listener := pq.NewListener(s.dsn, time.Second, time.Minute, nil)
-	defer listener.Close()
-
-	for channel := range s.handlers {
-		if err := listener.Listen(channel); err != nil {
-			return fmt.Errorf("pgqueue: LISTEN %s: %w", channel, err)
-		}
+	if !s.started.CompareAndSwap(false, true) {
+		return ErrAlreadyStarted
 	}
+	channels := make([]string, 0, len(s.handlers))
+	for channel := range s.handlers {
+		channels = append(channels, channel)
+	}
+
+	listener := pq.NewListener(s.dsn, time.Second, time.Minute, nil)
+	if err := listen(ctx, listener, channels...); err != nil {
+		return err
+	}
+	defer listener.Close()
 
 	for {
 		select {

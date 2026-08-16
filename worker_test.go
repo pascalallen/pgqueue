@@ -278,3 +278,140 @@ func TestWorker_RescuesJobsStuckInRunning(t *testing.T) {
 	})
 	assert.Equal(t, 2, getJob(t, db, id).Attempts)
 }
+
+func TestWorker_StaleRunCannotOverwriteASupersededJob(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	// Attempt 1 hangs past RescueAfter so the sweep re-queues the job and a
+	// second claim (attempt 2) completes it. When attempt 1 finally returns an
+	// error, its retry write must be a no-op: the job was superseded.
+	release := make(chan struct{})
+	secondDone := make(chan struct{})
+	cfg := fastPoll()
+	cfg.RescueAfter = 100 * time.Millisecond
+	w := pgqueue.NewWorker(db, cfg)
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		switch job.Attempts {
+		case 1:
+			<-release
+			return errors.New("slow run finally failed")
+		case 2:
+			close(secondDone)
+			return nil
+		}
+		return nil
+	})
+	startWorker(t, w)
+
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil)
+	require.NoError(t, err)
+
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rescued job was never re-run")
+	}
+	waitFor(t, 5*time.Second, "second run completed", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusCompleted)
+	})
+
+	close(release)
+	// Give the stale run time to issue its (ignored) retry write.
+	time.Sleep(300 * time.Millisecond)
+
+	row := getJob(t, db, id)
+	assert.Equal(t, string(pgqueue.StatusCompleted), row.Status, "a stale run must not overwrite the superseding run's result")
+	assert.Equal(t, 2, row.Attempts)
+	assert.False(t, row.LastError.Valid, "the stale run's error must not be recorded")
+}
+
+func TestWorker_RescueDeadLettersJobsThatExhaustedAttempts(t *testing.T) {
+	db := testDB(t)
+
+	// A poison pill: every attempt crashed the process before it could report
+	// back, so the row is stuck running with attempts already at the maximum.
+	var id int64
+	require.NoError(t, db.QueryRow(
+		`INSERT INTO pgqueue_jobs (queue, job_type, status, attempts, max_attempts, updated_at)
+		 VALUES ('default', 'SendWelcomeEmail', 'running', 3, 3, now() - interval '1 hour')
+		 RETURNING id`,
+	).Scan(&id))
+
+	calls := make(chan struct{}, 8)
+	cfg := fastPoll()
+	cfg.RescueAfter = 100 * time.Millisecond
+	w := pgqueue.NewWorker(db, cfg)
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		calls <- struct{}{}
+		return nil
+	})
+	startWorker(t, w)
+
+	waitFor(t, 5*time.Second, "exhausted job dead-lettered by rescue", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusDead)
+	})
+	row := getJob(t, db, id)
+	assert.Equal(t, 3, row.Attempts, "rescue must not grant another attempt")
+	assert.Contains(t, row.LastError.String, "max attempts")
+	assert.Empty(t, calls, "an exhausted job must not run again")
+}
+
+func TestWorker_StartHonorsContextWhileListenCannotConnect(t *testing.T) {
+	db := testDB(t)
+
+	// Nothing listens on port 1: the LISTEN connection can never be
+	// established, and lib/pq's Listen blocks until it is.
+	cfg := fastPoll()
+	cfg.ListenDSN = "host=127.0.0.1 port=1 user=postgres sslmode=disable connect_timeout=1"
+	w := pgqueue.NewWorker(db, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return after its context was canceled")
+	}
+}
+
+func TestWorker_SecondStartReturnsErrAlreadyStarted(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+	w := pgqueue.NewWorker(db, fastPoll())
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error { return nil })
+	startWorker(t, w)
+
+	// A completed job proves the first Start owns the worker before we race it.
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil)
+	require.NoError(t, err)
+	waitFor(t, 5*time.Second, "worker running", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusCompleted)
+	})
+
+	assert.ErrorIs(t, w.Start(context.Background()), pgqueue.ErrAlreadyStarted)
+}
+
+func TestWorker_RegisterAfterStartPanics(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+	w := pgqueue.NewWorker(db, fastPoll())
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error { return nil })
+	startWorker(t, w)
+
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil)
+	require.NoError(t, err)
+	waitFor(t, 5*time.Second, "worker running", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusCompleted)
+	})
+
+	assert.Panics(t, func() {
+		w.Register("Late", func(ctx context.Context, job pgqueue.Job) error { return nil })
+	})
+}

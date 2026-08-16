@@ -12,6 +12,11 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in go.mod and the current stable release.
+        go: ["1.24.x", "stable"]
     services:
       postgres:
         image: postgres:16
@@ -30,7 +35,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
           check-latest: true
 
       - name: Check formatting
@@ -38,6 +43,11 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
 
       - name: Test
         run: go test -race -cover ./...

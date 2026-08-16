@@ -58,3 +58,33 @@ func TestPublishSubscribe_FansOutToAllSubscribers(t *testing.T) {
 		assert.JSONEq(t, `{"group_id":"01ABC"}`, string(got[i]))
 	}
 }
+
+func TestSubscriber_StartHonorsContextWhileListenCannotConnect(t *testing.T) {
+	sub := pgqueue.NewSubscriber("host=127.0.0.1 port=1 user=postgres sslmode=disable connect_timeout=1", nil)
+	sub.Handle("pgqueue_test_channel", func(payload []byte) {})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- sub.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return after its context was canceled")
+	}
+}
+
+func TestSubscriber_HandleAfterStartPanics(t *testing.T) {
+	sub := pgqueue.NewSubscriber(testDSN(t), nil)
+	sub.Handle("pgqueue_test_channel", func(payload []byte) {})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = sub.Start(ctx) }()
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Panics(t, func() { sub.Handle("late", func(payload []byte) {}) })
+}
