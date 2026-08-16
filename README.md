@@ -59,7 +59,10 @@ Run a worker:
 ...
 
 w := pgqueue.NewWorker(db, pgqueue.WorkerConfig{
-    ListenDSN: dsn, // dedicated LISTEN connection for prompt wakeups; empty means poll-only
+    ListenDSN:  dsn,             // dedicated LISTEN connection for prompt wakeups; empty means poll-only
+    JobTimeout: 2 * time.Minute, // bound each handler; zero leaves handlers unbounded
+    Retain:     7 * 24 * time.Hour, // prune completed/dead jobs older than a week; zero never prunes
+    Middleware: []pgqueue.Middleware{ /* metrics, tracing — first entry is outermost */ },
 })
 
 w.Register("send_welcome_email", func(ctx context.Context, job pgqueue.Job) error {
@@ -125,6 +128,10 @@ if err := s.Start(ctx); err != nil {
 - A failed job retries with exponential backoff (default: doubling from 2s to a ceiling of ~4m16s, plus up to 25% jitter) until `MaxAttempts` (default 5), then remains in the table with `status = 'dead'` for inspection. Wrap an error with `pgqueue.Permanent` to skip retries and dead-letter immediately.
 - A rescue sweep re-queues jobs stuck in `running` longer than `RescueAfter` (default 5m) — orphans left by a crashed worker. This makes delivery at-least-once: handlers must tolerate being invoked more than once for the same job. A rescued job that has already used all of its attempts (one that crashed the process every time, say) is dead-lettered instead of re-queued.
 - Terminal writes are fenced on the claimed attempt: if a slow handler outlives `RescueAfter` and the job is rescued and re-run, the stale run's result is dropped rather than overwriting the newer run's. Set `RescueAfter` comfortably above your longest handler runtime so this stays a safety net, not the norm.
+
+### Retention
+
+Finished jobs stay in `pgqueue_jobs` for inspection until pruned. Set `WorkerConfig.Retain` to have the worker delete its queue's completed and dead jobs older than that during its maintenance sweep, or call `Queue.Prune(ctx, olderThan)` on your own schedule. Nothing is pruned by default.
 
 ### Schema ownership
 

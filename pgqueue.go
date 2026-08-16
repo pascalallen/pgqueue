@@ -33,6 +33,7 @@ type Job struct {
 	Attempts    int
 	MaxAttempts int
 	RunAt       time.Time
+	CreatedAt   time.Time
 	LastError   string
 }
 
@@ -162,6 +163,26 @@ func (q *Queue) enqueue(ctx context.Context, db DBTX, jobType string, payload []
 	q.logger.Debug("pgqueue: job enqueued", "job_id", id, "queue", q.name, "job_type", jobType)
 
 	return id, nil
+}
+
+const pruneQuery = `
+DELETE FROM pgqueue_jobs
+WHERE queue = $1 AND status IN ('completed', 'dead') AND updated_at < now() - make_interval(secs => $2)`
+
+// Prune deletes this queue's completed and dead jobs whose last update is
+// older than olderThan and reports how many rows went. Call it from your own
+// schedule, or set WorkerConfig.Retain to have the worker do it.
+func (q *Queue) Prune(ctx context.Context, olderThan time.Duration) (int64, error) {
+	res, err := q.db.ExecContext(ctx, pruneQuery, q.name, olderThan.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("pgqueue: prune %s: %w", q.name, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("pgqueue: prune %s: %w", q.name, err)
+	}
+
+	return n, nil
 }
 
 type permanentError struct {

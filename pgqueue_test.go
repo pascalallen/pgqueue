@@ -163,3 +163,42 @@ func TestEnqueueTx_HonorsTransactionOutcome(t *testing.T) {
 	require.NoError(t, tx.Commit())
 	assert.Equal(t, string(pgqueue.StatusPending), getJob(t, db, id).Status)
 }
+
+// --- prune tests ---
+
+func TestPrune_RemovesOnlyOldFinishedJobsOfTheQueue(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	insert := func(queue, status string, age string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRow(
+			`INSERT INTO pgqueue_jobs (queue, job_type, status, updated_at)
+			 VALUES ($1, 'SendWelcomeEmail', $2, now() - $3::interval) RETURNING id`, queue, status, age,
+		).Scan(&id))
+		return id
+	}
+	oldCompleted := insert("default", "completed", "2 hours")
+	oldDead := insert("default", "dead", "2 hours")
+	recentCompleted := insert("default", "completed", "1 minute")
+	oldPending := insert("default", "pending", "2 hours")
+	oldRunning := insert("default", "running", "2 hours")
+	otherQueueOldCompleted := insert("mail", "completed", "2 hours")
+
+	n, err := q.Prune(context.Background(), time.Hour)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+	assert.Equal(t, 4, countJobs(t, db))
+	for _, id := range []int64{recentCompleted, oldPending, oldRunning, otherQueueOldCompleted} {
+		var exists bool
+		require.NoError(t, db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pgqueue_jobs WHERE id = $1)`, id).Scan(&exists))
+		assert.True(t, exists, "job %d must survive the prune", id)
+	}
+	for _, id := range []int64{oldCompleted, oldDead} {
+		var exists bool
+		require.NoError(t, db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pgqueue_jobs WHERE id = $1)`, id).Scan(&exists))
+		assert.False(t, exists, "job %d must be pruned", id)
+	}
+}
