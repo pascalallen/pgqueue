@@ -3,6 +3,7 @@ package pgqueue_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -414,4 +415,190 @@ func TestWorker_RegisterAfterStartPanics(t *testing.T) {
 	assert.Panics(t, func() {
 		w.Register("Late", func(ctx context.Context, job pgqueue.Job) error { return nil })
 	})
+}
+
+func TestWorker_JobCarriesCreatedAt(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	got := make(chan pgqueue.Job, 1)
+	w := pgqueue.NewWorker(db, fastPoll())
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		got <- job
+		return nil
+	})
+	startWorker(t, w)
+
+	before := time.Now()
+	_, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil)
+	require.NoError(t, err)
+
+	select {
+	case job := <-got:
+		assert.WithinDuration(t, before, job.CreatedAt, 5*time.Second)
+	case <-time.After(5 * time.Second):
+		t.Fatal("job was not delivered")
+	}
+}
+
+func TestWorker_JobTimeoutCancelsHandlerContext(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	cfg := fastPoll()
+	cfg.JobTimeout = 100 * time.Millisecond
+	w := pgqueue.NewWorker(db, cfg)
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		<-ctx.Done() // a handler that only stops when told to
+		return ctx.Err()
+	})
+	startWorker(t, w)
+
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil, pgqueue.WithMaxAttempts(1))
+	require.NoError(t, err)
+
+	waitFor(t, 5*time.Second, "timed-out job dead-lettered", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusDead)
+	})
+	assert.Contains(t, getJob(t, db, id).LastError.String, context.DeadlineExceeded.Error())
+}
+
+// recordingLogger captures log calls so tests can assert on structured fields.
+type recordingLogger struct {
+	mu    sync.Mutex
+	calls []logCall
+}
+
+type logCall struct {
+	level   string
+	msg     string
+	keyVals []any
+}
+
+func (l *recordingLogger) record(level, msg string, kv []any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, logCall{level, msg, kv})
+}
+func (l *recordingLogger) Debug(msg string, kv ...any) { l.record("debug", msg, kv) }
+func (l *recordingLogger) Info(msg string, kv ...any)  { l.record("info", msg, kv) }
+func (l *recordingLogger) Warn(msg string, kv ...any)  { l.record("warn", msg, kv) }
+func (l *recordingLogger) Error(msg string, kv ...any) { l.record("error", msg, kv) }
+
+// value returns the value logged under key for the first call with msg.
+func (l *recordingLogger) value(msg, key string) (any, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, c := range l.calls {
+		if c.msg != msg {
+			continue
+		}
+		for i := 0; i+1 < len(c.keyVals); i += 2 {
+			if c.keyVals[i] == key {
+				return c.keyVals[i+1], true
+			}
+		}
+	}
+	return nil, false
+}
+
+func TestWorker_RetainPrunesFinishedJobsOlderThanRetain(t *testing.T) {
+	db := testDB(t)
+
+	var oldCompleted, recentCompleted int64
+	require.NoError(t, db.QueryRow(
+		`INSERT INTO pgqueue_jobs (queue, job_type, status, updated_at)
+		 VALUES ('default', 'SendWelcomeEmail', 'completed', now() - interval '1 hour') RETURNING id`).Scan(&oldCompleted))
+	require.NoError(t, db.QueryRow(
+		`INSERT INTO pgqueue_jobs (queue, job_type, status, updated_at)
+		 VALUES ('default', 'SendWelcomeEmail', 'completed', now() + interval '1 hour') RETURNING id`).Scan(&recentCompleted))
+
+	cfg := fastPoll()
+	cfg.Retain = 30 * time.Minute
+	w := pgqueue.NewWorker(db, cfg)
+	startWorker(t, w)
+
+	waitFor(t, 5*time.Second, "old completed job pruned", func() bool {
+		var exists bool
+		require.NoError(t, db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pgqueue_jobs WHERE id = $1)`, oldCompleted).Scan(&exists))
+		return !exists
+	})
+	var exists bool
+	require.NoError(t, db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pgqueue_jobs WHERE id = $1)`, recentCompleted).Scan(&exists))
+	assert.True(t, exists, "jobs younger than Retain must survive")
+}
+
+func TestWorker_HandlerPanicIsLoggedWithStack(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	logger := &recordingLogger{}
+	cfg := fastPoll()
+	cfg.Logger = logger
+	w := pgqueue.NewWorker(db, cfg)
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		panic("template blew up")
+	})
+	startWorker(t, w)
+
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil, pgqueue.WithMaxAttempts(1))
+	require.NoError(t, err)
+	waitFor(t, 5*time.Second, "panicking job dead", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusDead)
+	})
+
+	stack, ok := logger.value("pgqueue: handler panicked", "stack")
+	require.True(t, ok, "a panic must be logged with its stack")
+	assert.Contains(t, stack.(string), "goroutine")
+	panicked, _ := logger.value("pgqueue: handler panicked", "panic")
+	assert.Equal(t, "template blew up", panicked)
+}
+
+func TestWorker_MiddlewareWrapsHandlers(t *testing.T) {
+	db := testDB(t)
+	q := pgqueue.New(db)
+
+	var mu sync.Mutex
+	var trace []string
+	mw := func(name string) pgqueue.Middleware {
+		return func(next pgqueue.Handler) pgqueue.Handler {
+			return func(ctx context.Context, job pgqueue.Job) error {
+				mu.Lock()
+				trace = append(trace, name+":before:"+job.Type)
+				mu.Unlock()
+				err := next(ctx, job)
+				mu.Lock()
+				trace = append(trace, name+":after:"+fmt.Sprint(err))
+				mu.Unlock()
+				return err
+			}
+		}
+	}
+
+	cfg := fastPoll()
+	cfg.Middleware = []pgqueue.Middleware{mw("outer"), mw("inner")}
+	w := pgqueue.NewWorker(db, cfg)
+	w.Register("SendWelcomeEmail", func(ctx context.Context, job pgqueue.Job) error {
+		mu.Lock()
+		trace = append(trace, "handler")
+		mu.Unlock()
+		return pgqueue.Permanent(errors.New("boom"))
+	})
+	startWorker(t, w)
+
+	id, err := q.Enqueue(context.Background(), "SendWelcomeEmail", nil)
+	require.NoError(t, err)
+	waitFor(t, 5*time.Second, "job dead", func() bool {
+		return getJob(t, db, id).Status == string(pgqueue.StatusDead)
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{
+		"outer:before:SendWelcomeEmail",
+		"inner:before:SendWelcomeEmail",
+		"handler",
+		"inner:after:permanent: boom",
+		"outer:after:permanent: boom",
+	}, trace, "the first middleware is outermost and errors flow back through the chain")
 }
