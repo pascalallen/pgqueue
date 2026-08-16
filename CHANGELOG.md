@@ -6,6 +6,8 @@ All notable changes to this module are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-16
+
 ### Fixed
 - Terminal job writes (complete / retry / dead) are fenced on `status = 'running'`
   and the claimed attempt, so a run that was rescued and superseded while in
@@ -23,13 +25,13 @@ All notable changes to this module are documented here. The format follows
 
 ### Added
 - `WorkerConfig.JobTimeout` bounds each handler invocation; the handler's
-  context is canceled and the attempt fails with the context error. (#8)
+  context is canceled and the attempt fails with the context error. (#8, #13)
 - `Queue.Prune(ctx, olderThan)` deletes a queue's completed and dead jobs, and
-  `WorkerConfig.Retain` has the worker do so on its maintenance sweep. (#8)
+  `WorkerConfig.Retain` has the worker do so on its maintenance sweep. (#8, #13)
 - `WorkerConfig.Middleware` (`[]Middleware`, `func(Handler) Handler`) wraps
-  every registered handler — the hook for metrics and tracing. (#8)
-- `Job.CreatedAt`, so handlers and middleware can measure queue lag. (#8)
-- Recovered handler panics are logged with the panic value and stack. (#8)
+  every registered handler — the hook for metrics and tracing. (#8, #13)
+- `Job.CreatedAt`, so handlers and middleware can measure queue lag. (#8, #13)
+- Recovered handler panics are logged with the panic value and stack. (#8, #13)
 - `ErrAlreadyStarted`, returned by a second `Worker.Start` / `Subscriber.Start`.
 - Runnable examples on pkg.go.dev.
 - `CHANGELOG.md`, `AGENTS.md`, Dependabot, and a staticcheck step plus a Go
@@ -37,7 +39,7 @@ All notable changes to this module are documented here. The format follows
 
 ### Changed
 - The rescue sweep (and retention) runs once at startup and then on its own
-  ticker (`max(PollInterval, RescueAfter/2)`) instead of on every wakeup. (#8)
+  ticker (`max(PollInterval, RescueAfter/2)`) instead of on every wakeup. (#8, #13)
 - `Worker.Register` and `Subscriber.Handle` panic when called after `Start`
   instead of racing the running goroutine.
 - The `go` directive is now `1.24`, the floor the code actually needs, instead
