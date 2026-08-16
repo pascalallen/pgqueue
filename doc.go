@@ -9,8 +9,10 @@
 // consume the same queue without double-processing. Failed jobs retry with
 // backoff until MaxAttempts, then remain in the table with status 'dead'
 // for inspection. A rescue sweep re-queues jobs orphaned by a crashed
-// worker, which makes delivery at-least-once: handlers must tolerate being
-// invoked more than once for the same job.
+// worker (or dead-letters them once their attempts are used up), which makes
+// delivery at-least-once: handlers must tolerate being invoked more than once
+// for the same job. Terminal writes are fenced on the claimed attempt, so a
+// stale run can never overwrite the outcome of the run that superseded it.
 //
 // Publish and Subscriber wrap Postgres NOTIFY/LISTEN for fire-and-forget
 // fan-out to every listening process. Notifications carry no durability:

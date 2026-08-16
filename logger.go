@@ -1,8 +1,9 @@
 package pgqueue
 
 // Logger is the minimal structured-logging port used by this package. It is
-// deliberately a subset of common structured logger interfaces so that host
-// applications can pass their existing logger without an adapter.
+// deliberately a subset of common structured logger interfaces — *slog.Logger
+// satisfies it as-is — so that host applications can pass their existing
+// logger without an adapter.
 type Logger interface {
 	Debug(msg string, keyVals ...any)
 	Info(msg string, keyVals ...any)
